@@ -54,6 +54,13 @@ const testClassIcon = Image.icon('test-class.png')
 const testMethodIcon = Image.icon('test-method.png')
 const attachmentIcon = Image.icon('attachment.png')
 
+interface ConsolidatedTestResult {
+  test: ActionTestSummary
+  retryCount: number
+  finalStatus: string
+  mostRecentFailure?: ActionTestFailureSummary
+}
+
 export class Formatter {
   readonly summaries = ''
   readonly details = ''
@@ -150,6 +157,7 @@ export class Formatter {
       failed = 0
       skipped = 0
       expectedFailure = 0
+      retried = 0
       total = 0
     }
     type TestSummaryStatsGroup = {[key: string]: TestSummaryStats}
@@ -181,30 +189,36 @@ export class Formatter {
 
         const group: TestSummaryStatsGroup = {}
         for (const [identifier, details] of Object.entries(detailGroup)) {
-          const [stats, duration] = details.reduce(
-            ([stats, duration]: [TestSummaryStats, number], detail) => {
-              const test = detail as ActionTestSummary
-              if (test.testStatus) {
-                switch (test.testStatus) {
-                  case 'Success':
-                    stats.passed++
-                    break
-                  case 'Failure':
-                    stats.failed++
-                    break
-                  case 'Skipped':
-                    stats.skipped++
-                    break
-                  case 'Expected Failure':
-                    stats.expectedFailure++
-                    break
-                }
-
-                stats.total++
+          // Apply retry consolidation to avoid inflating test counts
+          const consolidatedResults = this.consolidateRetryAttempts(details)
+          
+          const [stats, duration] = consolidatedResults.reduce(
+            ([stats, duration]: [TestSummaryStats, number], consolidated) => {
+              // Use the final consolidated status instead of individual attempt status
+              switch (consolidated.finalStatus) {
+                case 'Success':
+                  stats.passed++
+                  break
+                case 'Failure':
+                  stats.failed++
+                  break
+                case 'Skipped':
+                  stats.skipped++
+                  break
+                case 'Expected Failure':
+                  stats.expectedFailure++
+                  break
               }
 
-              if (test.duration) {
-                duration = test.duration
+              // Count retries
+              if (consolidated.retryCount > 0) {
+                stats.retried++
+              }
+
+              stats.total++
+
+              if (consolidated.test.duration) {
+                duration = consolidated.test.duration
               }
               return [stats, duration]
             },
@@ -214,6 +228,7 @@ export class Formatter {
           testSummary.stats.failed += stats.failed
           testSummary.stats.skipped += stats.skipped
           testSummary.stats.expectedFailure += stats.expectedFailure
+          testSummary.stats.retried += stats.retried
           testSummary.stats.total += stats.total
           testSummary.duration += duration
 
@@ -222,6 +237,7 @@ export class Formatter {
             failed: stats.failed,
             skipped: stats.skipped,
             expectedFailure: stats.expectedFailure,
+            retried: stats.retried,
             total: stats.total
           }
         }
@@ -240,6 +256,7 @@ export class Formatter {
         `<th>${failedIcon}&nbsp;Failed`,
         `<th>${skippedIcon}&nbsp;Skipped`,
         `<th>${expectedFailureIcon}&nbsp;Expected Failure`,
+        `<th>🔄&nbsp;Retries`,
         `<th>:stopwatch:&nbsp;Time`
       ].join('')
       chapterSummary.content.push(header)
@@ -259,6 +276,7 @@ export class Formatter {
         `<td align="right" width="118px">${failedCount}`,
         `<td align="right" width="118px">${testSummary.stats.skipped}`,
         `<td align="right" width="158px">${testSummary.stats.expectedFailure}`,
+        `<td align="right" width="118px">${testSummary.stats.retried}`,
         `<td align="right" width="138px">${duration}s`
       ].join('')
       chapterSummary.content.push(cols)
@@ -299,7 +317,8 @@ export class Formatter {
           `<th>${passedIcon}`,
           `<th>${failedIcon}`,
           `<th>${skippedIcon}`,
-          `<th>${expectedFailureIcon}`
+          `<th>${expectedFailureIcon}`,
+          `<th>🔄`
         ].join('')
         chapterSummary.content.push(header)
 
@@ -326,7 +345,8 @@ export class Formatter {
             `<td align="right" width="80px">${stats.passed}`,
             `<td align="right" width="80px">${failedCount}`,
             `<td align="right" width="80px">${stats.skipped}`,
-            `<td align="right" width="80px">${stats.expectedFailure}`
+            `<td align="right" width="80px">${stats.expectedFailure}`,
+            `<td align="right" width="80px">${stats.retried}`
           ].join('')
           chapterSummary.content.push(cols)
         }
@@ -387,7 +407,8 @@ export class Formatter {
                 )
                 testFailures.failureGroups.push(testFailureGroup)
 
-                if (summary.failureSummaries) {
+                // Check if this test ultimately succeeded on retry
+                if (summary.failureSummaries && !this.testUltimatelySucceeded(details, summary)) {
                   const testFailure = new TestFailure()
                   testFailureGroup.failures.push(testFailure)
 
@@ -895,6 +916,100 @@ export class Formatter {
         testSummaries.push(test)
       }
     }
+  }
+
+  consolidateRetryAttempts(tests: actionTestSummaries): ConsolidatedTestResult[] {
+    const consolidatedResults: ConsolidatedTestResult[] = []
+    const testGroups = new Map<string, ActionTestSummary[]>()
+
+    // Group tests by identifier + name to find retry attempts
+    for (const test of tests) {
+      const actionTest = test as ActionTestSummary
+      if (!actionTest.identifier || !actionTest.name) {
+        // No identifier/name - treat as individual test
+        consolidatedResults.push({
+          test: actionTest,
+          retryCount: 0,
+          finalStatus: actionTest.testStatus
+        })
+        continue
+      }
+
+      const key = `${actionTest.identifier}_${actionTest.name}`
+      if (!testGroups.has(key)) {
+        testGroups.set(key, [])
+      }
+      testGroups.get(key)!.push(actionTest)
+    }
+
+    // Process each group to determine if retries occurred
+    for (const [key, groupTests] of testGroups) {
+      if (groupTests.length === 1) {
+        const singleTest = groupTests[0]
+        // Check for repetitionPolicySummary indicating retries
+        const retryCount = singleTest.repetitionPolicySummary?.totalIterations 
+          ? singleTest.repetitionPolicySummary.totalIterations - 1 
+          : 0
+
+        consolidatedResults.push({
+          test: singleTest,
+          retryCount,
+          finalStatus: singleTest.testStatus
+        })
+      } else {
+        // Multiple attempts - this is a retry scenario
+        const retryCount = groupTests.length - 1
+        
+        // Determine final status: Success if ANY attempt succeeded
+        const hasSuccess = groupTests.some(test => test.testStatus === 'Success')
+        const finalStatus = hasSuccess ? 'Success' : 'Failure'
+        
+        // Use the last test as the representative (most recent)
+        const representativeTest = groupTests[groupTests.length - 1]
+        
+        // Find most recent failure if final status is failure
+        let mostRecentFailure: ActionTestFailureSummary | undefined
+        if (finalStatus === 'Failure') {
+          for (let i = groupTests.length - 1; i >= 0; i--) {
+            const test = groupTests[i]
+            if (test.failureSummaries && test.failureSummaries.length > 0) {
+              mostRecentFailure = test.failureSummaries[0]
+              break
+            }
+          }
+        }
+
+        consolidatedResults.push({
+          test: representativeTest,
+          retryCount,
+          finalStatus,
+          mostRecentFailure
+        })
+      }
+    }
+
+    return consolidatedResults
+  }
+
+  testUltimatelySucceeded(details: actionTestSummaries, currentSummary: ActionTestSummary): boolean {
+    // Check if any other test in this group with the same identifier and name succeeded
+    for (const detail of details) {
+      const testResult = detail as ActionTestMetadata
+      if (testResult.summaryRef) {
+        try {
+          // We need to parse synchronously or cache results, but for simplicity,
+          // let's use the test status from metadata if available
+          if (testResult.testStatus === 'Success' && 
+              testResult.identifier === currentSummary.identifier &&
+              testResult.name === currentSummary.name) {
+            return true
+          }
+        } catch (error) {
+          // If we can't determine, assume no success
+        }
+      }
+    }
+    return false
   }
 
   async collectActivities(
